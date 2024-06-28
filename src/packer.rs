@@ -221,10 +221,14 @@ impl Packer {
             });
             stats.count += 1;
             stats.total_bytes += len - start_len;
+
+            if self.debug {
+                println!("{} bytes", len - start_len);
+            }
         };
 
         if self.debug {
-            println!("    {:?}", instr);
+            print!("    {:?}: ", instr);
         }
         match instr {
             SetKeyframe {
@@ -308,8 +312,8 @@ impl Packer {
         while let Some(m) = self.mappings.pop_front() {
             if self.debug {
                 println!(
-                    "current: thin {}, data {}, time {}",
-                    current_thin, regs[reg].data, regs[reg].snap_time,
+                    "current: thin {}, data {}, time {}, reg {}",
+                    current_thin, regs[reg].data, regs[reg].snap_time, reg,
                 );
                 println!(
                     "m:       thin {}, data {}, time {}, len {}",
@@ -325,60 +329,47 @@ impl Packer {
                 current_thin = m.thin_begin;
             }
 
-            // Choose the closest register
-            let (nearest_reg, nearest_diff) = regs
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (i, u64_sub_to_i64(m.data_begin, r.data).abs()))
-                .min_by_key(|&(_, diff)| diff)
-                .unwrap();
-
-            let near_enough = nearest_diff < new_reg_threshold;
-            if nearest_reg != reg && near_enough {
-                self.pack_instr(&mut w, &SwitchReg(nearest_reg as u64))?;
-                reg = nearest_reg;
-
-                // Apply a small delta if needed after switching
-                let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
-                if delta != 0 {
-                    self.pack_instr(&mut w, &DeltaData(delta))?;
+            if regs[reg].snap_time != m.time {
+                // see if this time is already in the reg file
+                let mut found = None;
+                for (i, r) in regs.iter().enumerate() {
+                    if r.snap_time == m.time {
+                        found = Some(i);
+                        break;
+                    }
                 }
-            } else if near_enough {
-                // continue with this reg
-                let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
-                self.pack_instr(&mut w, &DeltaData(delta))?;
-            } else {
-                // create new reg
-                self.pack_instr(&mut w, &NewReg)?;
-                let r = regs[reg].clone();
-                regs.push_front(r);
-                if regs.len() > 32 {
-                    regs.pop_back();
-                }
-                reg = 0;
 
+                if let Some(new_reg) = found {
+                    self.pack_instr(&mut w, &SwitchReg(new_reg as u64))?;
+                    reg = new_reg;
+                } else {
+                    self.pack_instr(&mut w, &NewReg)?;
+                    regs.push_front(regs[reg].clone());
+                    if regs.len() > 32 {
+                        regs.pop_back();
+                    }
+                    reg = 0;
+                    self.pack_instr(&mut w, &SetSnapTime(m.time as u64))?;
+                    regs[reg].snap_time = m.time;
+                }
+            }
+
+            if regs[reg].data != m.data_begin {
                 let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
                 self.pack_instr(&mut w, &DeltaData(delta))?;
                 regs[reg].data = m.data_begin;
-            }
-            regs[reg].data = m.data_begin;
-
-            if regs[reg].snap_time != m.time {
-                self.pack_instr(&mut w, &SetSnapTime(m.time as u64))?;
-                regs[reg].snap_time = m.time;
             }
 
             current_thin += m.len;
             regs[reg].data += m.len;
             self.pack_instr(&mut w, &Emit(m.len))?;
 
-            if w.len() > 4096 - header_size {
-                self.mappings.push_front(m.clone());
-                break;
-            }
-
             nr_entries += 1;
             nr_mapped_blocks += m.len;
+
+            if w.len() > 4096 - header_size {
+                break;
+            }
         }
 
         // increment the entry count bucket with nr_entries
@@ -391,7 +382,7 @@ impl Packer {
 
     // Build a node if we've got enough mappings to guarantee a full node.
     fn maybe_build_node(&mut self) -> Result<()> {
-        if self.mappings.len() > 1000 {
+        if self.mappings.len() > 10000 {
             self.build_node()
         } else {
             Ok(())
@@ -433,20 +424,19 @@ impl Packer {
     pub fn print_results(&self) {
         println!("Nr mapped blocks: {}", self.nr_mapped_blocks);
         println!(
-            "Total number of nodes: {}, {:.2}m",
+            "Total number of nodes: {} ({:.2} meg)",
             self.nr_nodes,
             (4096.0 * self.nr_nodes as f64) / (1024.0 * 1024.0)
         );
 
-        let (mean, std_dev) = self.calculate_stats();
+        let (mean, _std_dev) = self.calculate_stats();
 
-        println!("Entries per node:");
-        println!("  Mean: {:.2}", mean);
-        println!("  Standard Deviation: {:.2}", std_dev);
+        println!("Mean entries per node: {:.2}", mean);
+        println!("Mean bytes per entry: {:.2}", (4096.0 - 32.0) / mean);
 
         for (instr, stats) in &self.instr_stats {
             println!(
-                "{}: count {}, mean bytes {}",
+                "{}: count {}, mean bytes {:.2}",
                 Self::instr_name(*instr),
                 stats.count,
                 stats.total_bytes as f64 / stats.count as f64
@@ -483,7 +473,6 @@ impl Packer {
 
 impl MetadataVisitor for Packer {
     fn superblock_b(&mut self, _sb: &ir::Superblock) -> Result<Visit> {
-        eprintln!("superblock");
         Ok(Visit::Continue)
     }
 
@@ -492,7 +481,10 @@ impl MetadataVisitor for Packer {
     }
 
     fn def_shared_b(&mut self, _name: &str) -> Result<ir::Visit> {
-        self.new_node()?;
+        // Most of the refs in complex thinp1 metadata is for a single node, so ~100 entries.
+        // Which leaves us with very underfull nodes.  So I'm knocking out the new_node() call
+        // to merge everything together.  Will give more meaningful results, even if it's wrong.
+        // self.new_node()?;
         Ok(Visit::Continue)
     }
 
@@ -502,7 +494,7 @@ impl MetadataVisitor for Packer {
 
     // A device contains a number of 'map' or 'ref' items.
     fn device_b(&mut self, _d: &ir::Device) -> Result<Visit> {
-        self.new_node()?;
+        // self.new_node()?;
         Ok(Visit::Continue)
     }
 
@@ -517,7 +509,7 @@ impl MetadataVisitor for Packer {
     }
 
     fn ref_shared(&mut self, _name: &str) -> Result<Visit> {
-        self.new_node()?;
+        // self.new_node()?;
         Ok(Visit::Continue)
     }
 
