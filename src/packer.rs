@@ -177,6 +177,7 @@ struct InstrStats {
 // details about the nodes (eg, nr entries, nr_nodes) and throws
 // them away.
 pub struct Packer {
+    debug: bool,
     mappings: VecDeque<Map>,
 
     nr_nodes: usize,
@@ -191,6 +192,7 @@ pub struct Packer {
 impl Default for Packer {
     fn default() -> Self {
         Self {
+            debug: false,
             mappings: VecDeque::new(),
             nr_nodes: 0,
             nr_mapped_blocks: 0,
@@ -221,7 +223,9 @@ impl Packer {
             stats.total_bytes += len - start_len;
         };
 
-        // eprintln!("    {:?}", instr);
+        if self.debug {
+            println!("    {:?}", instr);
+        }
         match instr {
             SetKeyframe {
                 thin,
@@ -302,14 +306,16 @@ impl Packer {
         }
 
         while let Some(m) = self.mappings.pop_front() {
-            // eprintln!(
-            //     "current: thin {}, data {}, time {}",
-            //     current_thin, regs[reg].data, regs[reg].snap_time,
-            // );
-            // eprintln!(
-            //     "m:       thin {}, data {}, time {}, len {}",
-            //     m.thin_begin, m.data_begin, m.time, m.len
-            // );
+            if self.debug {
+                println!(
+                    "current: thin {}, data {}, time {}",
+                    current_thin, regs[reg].data, regs[reg].snap_time,
+                );
+                println!(
+                    "m:       thin {}, data {}, time {}, len {}",
+                    m.thin_begin, m.data_begin, m.time, m.len
+                );
+            }
 
             if current_thin != m.thin_begin {
                 self.pack_instr(
@@ -412,13 +418,13 @@ impl Packer {
 
     fn instr_name(instr: u8) -> &'static str {
         match instr {
-            0 => "key frame",
+            0 => "key frame ",
             1 => "delta thin",
-            2 => "set data",
+            2 => "set data  ",
             3 => "delta data",
-            4 => "set time",
-            5 => "emit",
-            6 => "new reg",
+            4 => "set time  ",
+            5 => "emit      ",
+            6 => "new reg   ",
             7 => "switch reg",
             _ => panic!("unknown instruction"),
         }
