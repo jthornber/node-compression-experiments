@@ -149,7 +149,7 @@ pub fn write_varint_with_field_signed<W: Write>(
 
 //------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Ord, PartialOrd, PartialEq, Eq)]
 enum Instruction {
     SetKeyframe {
         thin: u64,
@@ -166,48 +166,12 @@ enum Instruction {
     SwitchReg(u64),
 }
 
-fn pack_instr<W: Write>(w: &mut W, instr: &Instruction) -> Result<()> {
-    use Instruction::*;
-
-    // eprintln!("    {:?}", instr);
-    match instr {
-        SetKeyframe {
-            thin,
-            data,
-            snap_time,
-        } => {
-            write_varint_with_field(w, 0, *thin)?;
-            write_varint(w, *data)?;
-            write_varint(w, *snap_time as u64)?;
-        }
-        DeltaThin(delta) => {
-            write_varint_with_field_signed(w, 1, *delta)?;
-        }
-        SetData(data) => {
-            write_varint_with_field(w, 2, *data)?;
-        }
-        DeltaData(delta) => {
-            write_varint_with_field_signed(w, 3, *delta)?;
-        }
-        SetSnapTime(time) => {
-            write_varint_with_field(w, 4, *time as u64)?;
-        }
-        Emit(len) => {
-            write_varint_with_field(w, 5, *len)?;
-        }
-        NewReg => {
-            w.write_u8(6)?;
-        }
-        SwitchReg(reg) => {
-            assert!(*reg < 32);
-            w.write_u8(7 << 5 | *reg as u8)?;
-        }
-    }
-
-    Ok(())
-}
-
 //------------------------------------------
+
+struct InstrStats {
+    count: usize,
+    total_bytes: usize,
+}
 
 // Walks all the mappings building up nodes.  It then records
 // details about the nodes (eg, nr entries, nr_nodes) and throws
@@ -216,9 +180,12 @@ pub struct Packer {
     mappings: VecDeque<Map>,
 
     nr_nodes: usize,
+    nr_mapped_blocks: u64,
 
     // (nr_entries, nr nodes with this count)
     entry_counts: BTreeMap<usize, usize>,
+
+    instr_stats: BTreeMap<u8, InstrStats>,
 }
 
 impl Default for Packer {
@@ -226,7 +193,9 @@ impl Default for Packer {
         Self {
             mappings: VecDeque::new(),
             nr_nodes: 0,
+            nr_mapped_blocks: 0,
             entry_counts: BTreeMap::new(),
+            instr_stats: BTreeMap::new(),
         }
     }
 }
@@ -238,6 +207,67 @@ struct Register {
 }
 
 impl Packer {
+    fn pack_instr(&mut self, w: &mut Vec<u8>, instr: &Instruction) -> Result<()> {
+        use Instruction::*;
+
+        let start_len = w.len();
+
+        let mut update_stats = |code, len: usize| {
+            let stats = self.instr_stats.entry(code).or_insert(InstrStats {
+                count: 0,
+                total_bytes: 0,
+            });
+            stats.count += 1;
+            stats.total_bytes += len - start_len;
+        };
+
+        // eprintln!("    {:?}", instr);
+        match instr {
+            SetKeyframe {
+                thin,
+                data,
+                snap_time,
+            } => {
+                write_varint_with_field(w, 0, *thin)?;
+                write_varint(w, *data)?;
+                write_varint(w, *snap_time as u64)?;
+
+                update_stats(0, w.len());
+            }
+            DeltaThin(delta) => {
+                write_varint_with_field_signed(w, 1, *delta)?;
+                update_stats(1, w.len());
+            }
+            SetData(data) => {
+                write_varint_with_field(w, 2, *data)?;
+                update_stats(2, w.len());
+            }
+            DeltaData(delta) => {
+                write_varint_with_field_signed(w, 3, *delta)?;
+                update_stats(3, w.len());
+            }
+            SetSnapTime(time) => {
+                write_varint_with_field(w, 4, *time as u64)?;
+                update_stats(4, w.len());
+            }
+            Emit(len) => {
+                write_varint_with_field(w, 5, *len)?;
+                update_stats(5, w.len());
+            }
+            NewReg => {
+                w.write_u8(6)?;
+                update_stats(6, w.len());
+            }
+            SwitchReg(reg) => {
+                assert!(*reg < 32);
+                w.write_u8(7 << 5 | *reg as u8)?;
+                update_stats(7, w.len());
+            }
+        }
+
+        Ok(())
+    }
+
     // Builds a fake node, removing just enough entries from the mappings queue.
     // Then adjusts the stats.
     fn build_node(&mut self) -> Result<()> {
@@ -248,13 +278,14 @@ impl Packer {
 
         let mut w: Vec<u8> = Vec::new();
         let mut nr_entries = 0;
+        let mut nr_mapped_blocks = 0;
 
         // Emit the key frame.
         let mut reg = 0;
         let mut regs = VecDeque::new();
         let mut current_thin = 0;
         if let Some(m) = self.mappings.pop_front() {
-            pack_instr(
+            self.pack_instr(
                 &mut w,
                 &SetKeyframe {
                     thin: m.thin_begin,
@@ -281,7 +312,7 @@ impl Packer {
             // );
 
             if current_thin != m.thin_begin {
-                pack_instr(
+                self.pack_instr(
                     &mut w,
                     &DeltaThin(u64_sub_to_i64(m.thin_begin, current_thin)),
                 )?;
@@ -292,27 +323,27 @@ impl Packer {
             let (nearest_reg, nearest_diff) = regs
                 .iter()
                 .enumerate()
-                .map(|(i, r)| (i, u64_sub_to_i64(m.data_begin, r.data)))
+                .map(|(i, r)| (i, u64_sub_to_i64(m.data_begin, r.data).abs()))
                 .min_by_key(|&(_, diff)| diff)
                 .unwrap();
 
-            let near_enough = nearest_diff > 0 && nearest_diff < new_reg_threshold;
+            let near_enough = nearest_diff < new_reg_threshold;
             if nearest_reg != reg && near_enough {
-                pack_instr(&mut w, &SwitchReg(nearest_reg as u64))?;
+                self.pack_instr(&mut w, &SwitchReg(nearest_reg as u64))?;
                 reg = nearest_reg;
 
                 // Apply a small delta if needed after switching
-                let small_delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
-                if small_delta != 0 {
-                    pack_instr(&mut w, &DeltaData(small_delta))?;
+                let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
+                if delta != 0 {
+                    self.pack_instr(&mut w, &DeltaData(delta))?;
                 }
             } else if near_enough {
                 // continue with this reg
                 let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
-                pack_instr(&mut w, &DeltaData(delta))?;
+                self.pack_instr(&mut w, &DeltaData(delta))?;
             } else {
                 // create new reg
-                pack_instr(&mut w, &NewReg)?;
+                self.pack_instr(&mut w, &NewReg)?;
                 let r = regs[reg].clone();
                 regs.push_front(r);
                 if regs.len() > 32 {
@@ -321,19 +352,19 @@ impl Packer {
                 reg = 0;
 
                 let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
-                pack_instr(&mut w, &DeltaData(delta))?;
+                self.pack_instr(&mut w, &DeltaData(delta))?;
                 regs[reg].data = m.data_begin;
             }
             regs[reg].data = m.data_begin;
 
             if regs[reg].snap_time != m.time {
-                pack_instr(&mut w, &SetSnapTime(m.time as u64))?;
+                self.pack_instr(&mut w, &SetSnapTime(m.time as u64))?;
                 regs[reg].snap_time = m.time;
             }
 
             current_thin += m.len;
             regs[reg].data += m.len;
-            pack_instr(&mut w, &Emit(m.len))?;
+            self.pack_instr(&mut w, &Emit(m.len))?;
 
             if w.len() > 4096 - header_size {
                 self.mappings.push_front(m.clone());
@@ -341,11 +372,13 @@ impl Packer {
             }
 
             nr_entries += 1;
+            nr_mapped_blocks += m.len;
         }
 
         // increment the entry count bucket with nr_entries
         *self.entry_counts.entry(nr_entries).or_insert(0) += 1;
         self.nr_nodes += 1;
+        self.nr_mapped_blocks += nr_mapped_blocks;
 
         Ok(())
     }
@@ -377,7 +410,22 @@ impl Packer {
         self.mappings.push_back(m.clone());
     }
 
+    fn instr_name(instr: u8) -> &'static str {
+        match instr {
+            0 => "key frame",
+            1 => "delta thin",
+            2 => "set data",
+            3 => "delta data",
+            4 => "set time",
+            5 => "emit",
+            6 => "new reg",
+            7 => "switch reg",
+            _ => panic!("unknown instruction"),
+        }
+    }
+
     pub fn print_results(&self) {
+        println!("Nr mapped blocks: {}", self.nr_mapped_blocks);
         println!(
             "Total number of nodes: {}, {:.2}m",
             self.nr_nodes,
@@ -389,6 +437,15 @@ impl Packer {
         println!("Entries per node:");
         println!("  Mean: {:.2}", mean);
         println!("  Standard Deviation: {:.2}", std_dev);
+
+        for (instr, stats) in &self.instr_stats {
+            println!(
+                "{}: count {}, mean bytes {}",
+                Self::instr_name(*instr),
+                stats.count,
+                stats.total_bytes as f64 / stats.count as f64
+            );
+        }
     }
 
     fn calculate_stats(&self) -> (f64, f64) {
