@@ -154,6 +154,7 @@ enum Instruction {
 
 //------------------------------------------
 
+#[derive(Clone)]
 struct InstrStats {
     count: usize,
     total_bytes: usize,
@@ -248,8 +249,8 @@ impl Packer {
             stats.total_bytes += len - start_len;
         };
 
-        // emit: 0
-        // inc data: 11
+        // emit: 11
+        // inc data: 0
         // switch reg: 101
         // dec data: 1001
         // shift: 1000 1
@@ -279,7 +280,7 @@ impl Packer {
                 update_stats(2, w.len());
             }
             IncData(delta) => {
-                write_varint_with_field(w, 0b11, 2, *delta)?;
+                write_varint_with_field(w, 0b0, 1, *delta)?;
                 update_stats(3, w.len());
             }
             DecData(delta) => {
@@ -287,7 +288,7 @@ impl Packer {
                 update_stats(4, w.len());
             }
             Emit(len) => {
-                write_varint_with_field(w, 0b0, 1, *len)?;
+                write_varint_with_field(w, 0b11, 2, *len)?;
                 update_stats(5, w.len());
             }
             NewReg(delta_time) => {
@@ -518,12 +519,19 @@ impl Packer {
         );
         println!("Mean bytes per entry: {:.2}", (4096.0 - 32.0) / mean);
 
-        for (instr, stats) in &self.instr_stats {
+        let mut instr_stats = Vec::new();
+        for (k, v) in &self.instr_stats {
+            instr_stats.push((k, v.clone()));
+        }
+
+        instr_stats.sort_by(|a, b| b.1.total_bytes.cmp(&a.1.total_bytes));
+        for (instr, stats) in instr_stats {
             println!(
-                "{}: count {}, mean bytes {:.2}",
+                "{:16}: count {:8}, mean bytes {:6.2}, total bytes {:10}",
                 Self::instr_name(*instr),
                 stats.count,
-                stats.total_bytes as f64 / stats.count as f64
+                stats.total_bytes as f64 / stats.count as f64,
+                stats.total_bytes
             );
         }
     }
