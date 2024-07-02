@@ -1,12 +1,22 @@
 use anyhow::Result;
-use byteorder::{LittleEndian, WriteBytesExt};
+use byteorder::WriteBytesExt;
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Write};
+use std::fmt::Write;
+use std::io::{self};
+use std::string::String;
 use thinp::thin::ir::{self, Map, MetadataVisitor, Visit};
 
 use crate::varint::*;
 
 //------------------------------------------
+
+fn highest_set_bit_position(n: u8) -> u8 {
+    if n == 0 {
+        1 // this is for the instruction coding, we must have at least 1 bit
+    } else {
+        8 - n.leading_zeros() as u8
+    }
+}
 
 pub fn u64_sub_to_i64(a: u64, b: u64) -> i64 {
     match a.cmp(&b) {
@@ -82,25 +92,22 @@ mod tests {
 
 //------------------------------------------
 
-pub fn write_varint_with_field<W: Write>(
+pub fn write_varint_with_field<W: io::Write>(
     writer: &mut W,
     field: u8,
+    bits: u8,
     mut value: u64,
 ) -> io::Result<()> {
-    if field > 0b111 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Field must be 3 bits or less",
-        ));
-    }
+    let shift = 8 - bits;
+    let mask = (1 << (shift - 1)) - 1;
 
-    if value <= 0x0F {
-        // If value fits in 4 bits, pack it with the field in a single byte
-        writer.write_u8(((field & 0b111) << 5) | (value as u8 & 0x0F))?;
+    if value <= ((1 << (shift - 1)) - 1) {
+        // pack it with the field in a single byte
+        writer.write_u8((field << shift) | value as u8)?;
     } else {
         // Write first byte with field and continuation bit
-        writer.write_u8(((field & 0b111) << 5) | 0x10 | ((value & 0x0F) as u8))?;
-        value >>= 4;
+        writer.write_u8((field << shift) | (1 << (shift - 1)) | ((value & mask) as u8))?;
+        value >>= shift - 1;
 
         // Write remaining bytes as in the original varint encoding
         while value > 0x7F {
@@ -113,39 +120,17 @@ pub fn write_varint_with_field<W: Write>(
     Ok(())
 }
 
-pub fn write_varint_with_field_signed<W: Write>(
+/*
+pub fn write_varint_with_field_signed<W: io::Write>(
     writer: &mut W,
     field: u8,
     value: i64,
 ) -> io::Result<()> {
-    if field > 0b111 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Field must be 3 bits or less",
-        ));
-    }
-
     // ZigZag encode the signed value
     let encoded = zigzag_encode(value);
-
-    if encoded <= 0x0F {
-        // If encoded value fits in 4 bits, pack it with the field in a single byte
-        writer.write_u8(((field & 0b111) << 5) | (encoded as u8 & 0x0F))?;
-    } else {
-        // Write first byte with field and continuation bit
-        writer.write_u8(((field & 0b111) << 5) | 0x10 | ((encoded & 0x0F) as u8))?;
-        let mut remaining = encoded >> 4;
-
-        // Write remaining bytes as in the original varint encoding
-        while remaining > 0x7F {
-            writer.write_u8(((remaining & 0x7F) | 0x80) as u8)?;
-            remaining >>= 7;
-        }
-        writer.write_u8(remaining as u8)?;
-    }
-
-    Ok(())
+    write_varint_with_field(writer, field, encoded)
 }
+*/
 
 //------------------------------------------
 
@@ -156,14 +141,16 @@ enum Instruction {
         data: u64,
         snap_time: u32,
     },
-    DeltaThin(i64),
-    SetData(u64),
-    DeltaData(i64),
-    SetSnapTime(u64),
+    IncThin(u64),
+    DecThin(u64), // shouldn't need this in the real thing
+    IncData(u64),
+    DecData(u64),
 
-    Emit(u64), // adds len to both thin and data
-    NewReg,    // Pushes a new reg which becomes the new reg[0]
+    Emit(u64),   // adds len to both thin and data
+    NewReg(u64), // Pushes a new reg which becomes the new reg[0], payload is the new time
     SwitchReg(u64),
+    Shift(u8),
+    Halt,
 }
 
 //------------------------------------------
@@ -208,72 +195,139 @@ struct Register {
     snap_time: u32,
 }
 
+fn format_hex(bytes: &[u8]) -> String {
+    let mut s = String::new();
+
+    for &b in bytes {
+        write!(&mut s, "{:02x}", b).unwrap();
+    }
+
+    s
+}
+
+fn format_instr(instr: &Instruction) -> String {
+    use Instruction::*;
+
+    match instr {
+        SetKeyframe {
+            thin,
+            data,
+            snap_time,
+        } => format!("keyframe {}, {}, {}", thin, data, snap_time),
+        IncThin(delta) => format!("thin +{}", delta),
+        DecThin(delta) => format!("thin -{}", delta),
+        IncData(delta) => format!("data +{}", delta),
+        DecData(delta) => format!("data -{}", delta),
+
+        Emit(len) => format!("emit {}", len), // adds len to both thin and data
+        NewReg(time) => format!("push {}", time), // Pushes a new reg which becomes the new reg[0]
+        SwitchReg(reg) => format!("reg {}", reg),
+        Shift(count) => format!("shift {}", count),
+        Halt => format!("halt"),
+    }
+}
+
 impl Packer {
-    fn pack_instr(&mut self, w: &mut Vec<u8>, instr: &Instruction) -> Result<()> {
+    fn pack_instr_(
+        &mut self,
+        w: &mut Vec<u8>,
+        instr: &Instruction,
+        comment: Option<String>,
+    ) -> Result<()> {
         use Instruction::*;
+
+        assert!(*instr != Emit(0));
 
         let start_len = w.len();
 
-        let mut update_stats = |code, len: usize| {
+        let mut update_stats = |code, len| {
             let stats = self.instr_stats.entry(code).or_insert(InstrStats {
                 count: 0,
                 total_bytes: 0,
             });
             stats.count += 1;
             stats.total_bytes += len - start_len;
-
-            if self.debug {
-                println!("{} bytes", len - start_len);
-            }
         };
 
-        if self.debug {
-            print!("    {:?}: ", instr);
-        }
+        // emit: 0
+        // inc data: 11
+        // switch reg: 101
+        // dec data: 1001
+        // shift: 1000 1
+        // inc thin: 1000 01
+        // new reg: 1000 001
+        // dec thin: 1000 0001
+        // halt: 0000 0000
+        // key frame: 1000 0000
         match instr {
             SetKeyframe {
                 thin,
                 data,
                 snap_time,
             } => {
-                write_varint_with_field(w, 0, *thin)?;
+                write_varint_with_field(w, 0b1000_0000, 8, *thin)?;
                 write_varint(w, *data)?;
                 write_varint(w, *snap_time as u64)?;
 
                 update_stats(0, w.len());
             }
-            DeltaThin(delta) => {
-                write_varint_with_field_signed(w, 1, *delta)?;
+            IncThin(delta) => {
+                write_varint_with_field(w, 0b1000_01, 6, *delta)?;
                 update_stats(1, w.len());
             }
-            SetData(data) => {
-                write_varint_with_field(w, 2, *data)?;
+            DecThin(delta) => {
+                write_varint_with_field(w, 0b1000_0001, 8, *delta)?;
                 update_stats(2, w.len());
             }
-            DeltaData(delta) => {
-                write_varint_with_field_signed(w, 3, *delta)?;
+            IncData(delta) => {
+                write_varint_with_field(w, 0b11, 2, *delta)?;
                 update_stats(3, w.len());
             }
-            SetSnapTime(time) => {
-                write_varint_with_field(w, 4, *time as u64)?;
+            DecData(delta) => {
+                write_varint_with_field(w, 0b1001, 4, *delta)?;
                 update_stats(4, w.len());
             }
             Emit(len) => {
-                write_varint_with_field(w, 5, *len)?;
+                write_varint_with_field(w, 0b0, 1, *len)?;
                 update_stats(5, w.len());
             }
-            NewReg => {
-                w.write_u8(6)?;
+            NewReg(time) => {
+                write_varint_with_field(w, 0b1000_01, 6, *time)?;
                 update_stats(6, w.len());
             }
             SwitchReg(reg) => {
                 assert!(*reg < 32);
-                w.write_u8(7 << 5 | *reg as u8)?;
+                w.write_u8(0b101 << 5 | *reg as u8)?;
                 update_stats(7, w.len());
+            }
+            Shift(count) => {
+                // FIXME: more than 8 instrs, so should huffman encode
+                w.write_u8(0b1000_1 << 3 | *count)?;
+                update_stats(8, w.len());
+            }
+            Halt => {
+                // FIXME: more than 8 instrs, so should huffman encode
+                w.write_u8(0b00000000)?;
+                update_stats(9, w.len());
+            }
+        }
+
+        if self.debug {
+            let hex = format_hex(&w[start_len..w.len()]);
+            let instr = format_instr(&instr);
+
+            if let Some(comment) = comment {
+                println!("{:25}{:}\t\t;; {}", hex, instr, comment);
+            } else {
+                println!("{:25}{:}", hex, instr);
             }
         }
 
         Ok(())
+    }
+
+    fn pack_instr(&mut self, w: &mut Vec<u8>, instr: &Instruction) -> Result<()> {
+        self.pack_instr_(w, instr, None)
     }
 
     // Builds a fake node, removing just enough entries from the mappings queue.
@@ -282,7 +336,6 @@ impl Packer {
         use Instruction::*;
 
         let header_size = 32;
-        let new_reg_threshold = 4096 * 256;
 
         let mut w: Vec<u8> = Vec::new();
         let mut nr_entries = 0;
@@ -292,6 +345,8 @@ impl Packer {
         let mut reg = 0;
         let mut regs = VecDeque::new();
         let mut current_thin = 0;
+        let mut shift = 0;
+        let mut last_shift = 0;
         if let Some(m) = self.mappings.pop_front() {
             self.pack_instr(
                 &mut w,
@@ -301,6 +356,7 @@ impl Packer {
                     snap_time: m.time,
                 },
             )?;
+            self.pack_instr(&mut w, &Emit(m.len >> shift))?;
 
             current_thin = m.thin_begin + m.len;
             regs.push_front(Register {
@@ -310,22 +366,22 @@ impl Packer {
         }
 
         while let Some(m) = self.mappings.pop_front() {
-            if self.debug {
-                println!(
-                    "current: thin {}, data {}, time {}, reg {}",
-                    current_thin, regs[reg].data, regs[reg].snap_time, reg,
-                );
-                println!(
-                    "m:       thin {}, data {}, time {}, len {}",
-                    m.thin_begin, m.data_begin, m.time, m.len
-                );
+            let new_shift = (current_thin | m.thin_begin | regs[reg].data | m.data_begin | m.len)
+                .trailing_zeros();
+            if new_shift != shift {
+                if new_shift > shift && last_shift != new_shift {
+                    last_shift = new_shift;
+                } else {
+                    shift = new_shift;
+                    self.pack_instr(&mut w, &Shift(shift as u8))?;
+                }
             }
-
             if current_thin != m.thin_begin {
-                self.pack_instr(
-                    &mut w,
-                    &DeltaThin(u64_sub_to_i64(m.thin_begin, current_thin)),
-                )?;
+                if m.thin_begin > current_thin {
+                    self.pack_instr(&mut w, &IncThin((m.thin_begin - current_thin) >> shift))?;
+                } else {
+                    self.pack_instr(&mut w, &DecThin((current_thin - m.thin_begin) >> shift))?
+                }
                 current_thin = m.thin_begin;
             }
 
@@ -343,26 +399,38 @@ impl Packer {
                     self.pack_instr(&mut w, &SwitchReg(new_reg as u64))?;
                     reg = new_reg;
                 } else {
-                    self.pack_instr(&mut w, &NewReg)?;
+                    self.pack_instr(&mut w, &NewReg(m.time as u64))?;
                     regs.push_front(regs[reg].clone());
                     if regs.len() > 32 {
                         regs.pop_back();
                     }
                     reg = 0;
-                    self.pack_instr(&mut w, &SetSnapTime(m.time as u64))?;
                     regs[reg].snap_time = m.time;
                 }
             }
 
             if regs[reg].data != m.data_begin {
-                let delta = u64_sub_to_i64(m.data_begin, regs[reg].data);
-                self.pack_instr(&mut w, &DeltaData(delta))?;
+                if m.data_begin > regs[reg].data {
+                    self.pack_instr(&mut w, &IncData((m.data_begin - regs[reg].data) >> shift))?;
+                } else {
+                    self.pack_instr(&mut w, &DecData((regs[reg].data - m.data_begin) >> shift))?;
+                }
                 regs[reg].data = m.data_begin;
             }
 
             current_thin += m.len;
             regs[reg].data += m.len;
-            self.pack_instr(&mut w, &Emit(m.len))?;
+
+            if self.debug {
+                let comment = format!(
+                    "thin={}, data={}, time={}, len={}",
+                    m.thin_begin, m.data_begin, m.time, m.len
+                );
+                self.pack_instr_(&mut w, &Emit(m.len >> shift), Some(comment))?;
+                println!("");
+            } else {
+                self.pack_instr(&mut w, &Emit(m.len >> shift))?;
+            }
 
             nr_entries += 1;
             nr_mapped_blocks += m.len;
@@ -371,6 +439,7 @@ impl Packer {
                 break;
             }
         }
+        self.pack_instr(&mut w, &Halt)?;
 
         // increment the entry count bucket with nr_entries
         *self.entry_counts.entry(nr_entries).or_insert(0) += 1;
@@ -404,19 +473,28 @@ impl Packer {
 
     // FIXME: convert to 4k blocks
     fn push_mapping(&mut self, m: &Map) {
-        self.mappings.push_back(m.clone());
+        // Assume 32k blocks, which is 4k * 8
+        let m = Map {
+            thin_begin: m.thin_begin * 8,
+            data_begin: m.data_begin * 8,
+            time: m.time,
+            len: m.len * 8,
+        };
+        self.mappings.push_back(m);
     }
 
     fn instr_name(instr: u8) -> &'static str {
         match instr {
             0 => "key frame ",
-            1 => "delta thin",
-            2 => "set data  ",
-            3 => "delta data",
-            4 => "set time  ",
+            1 => "inc thin  ",
+            2 => "dec thin  ",
+            3 => "inc data  ",
+            4 => "dec data  ",
             5 => "emit      ",
             6 => "new reg   ",
             7 => "switch reg",
+            8 => "shift     ",
+            9 => "halt      ",
             _ => panic!("unknown instruction"),
         }
     }
@@ -432,6 +510,10 @@ impl Packer {
         let (mean, _std_dev) = self.calculate_stats();
 
         println!("Mean entries per node: {:.2}", mean);
+        println!(
+            "Mean run length: {:.2}",
+            self.nr_mapped_blocks as f64 / (self.nr_nodes as f64 * mean * 8.0)
+        );
         println!("Mean bytes per entry: {:.2}", (4096.0 - 32.0) / mean);
 
         for (instr, stats) in &self.instr_stats {
