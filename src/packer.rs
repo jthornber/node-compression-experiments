@@ -120,17 +120,16 @@ pub fn write_varint_with_field<W: io::Write>(
     Ok(())
 }
 
-/*
 pub fn write_varint_with_field_signed<W: io::Write>(
     writer: &mut W,
     field: u8,
+    bits: u8,
     value: i64,
 ) -> io::Result<()> {
     // ZigZag encode the signed value
     let encoded = zigzag_encode(value);
-    write_varint_with_field(writer, field, encoded)
+    write_varint_with_field(writer, field, bits, encoded)
 }
-*/
 
 //------------------------------------------
 
@@ -147,7 +146,7 @@ enum Instruction {
     DecData(u64),
 
     Emit(u64),   // adds len to both thin and data
-    NewReg(u64), // Pushes a new reg which becomes the new reg[0], payload is the new time
+    NewReg(i64), // Pushes a new reg which becomes the new reg[0], payload is the new time delta
     SwitchReg(u64),
     Shift(u8),
     Halt,
@@ -220,7 +219,7 @@ fn format_instr(instr: &Instruction) -> String {
         DecData(delta) => format!("data -{}", delta),
 
         Emit(len) => format!("emit {}", len), // adds len to both thin and data
-        NewReg(time) => format!("push {}", time), // Pushes a new reg which becomes the new reg[0]
+        NewReg(time) => format!("push {:+}", time), // Pushes a new reg which becomes the new reg[0]
         SwitchReg(reg) => format!("reg {}", reg),
         Shift(count) => format!("shift {}", count),
         Halt => format!("halt"),
@@ -291,8 +290,8 @@ impl Packer {
                 write_varint_with_field(w, 0b0, 1, *len)?;
                 update_stats(5, w.len());
             }
-            NewReg(time) => {
-                write_varint_with_field(w, 0b1000_01, 6, *time)?;
+            NewReg(delta_time) => {
+                write_varint_with_field_signed(w, 0b1000_01, 6, *delta_time)?;
                 update_stats(6, w.len());
             }
             SwitchReg(reg) => {
@@ -399,7 +398,10 @@ impl Packer {
                     self.pack_instr(&mut w, &SwitchReg(new_reg as u64))?;
                     reg = new_reg;
                 } else {
-                    self.pack_instr(&mut w, &NewReg(m.time as u64))?;
+                    self.pack_instr(
+                        &mut w,
+                        &NewReg(u64_sub_to_i64(m.time as u64, regs[reg].snap_time as u64)),
+                    )?;
                     regs.push_front(regs[reg].clone());
                     if regs.len() > 32 {
                         regs.pop_back();
