@@ -108,7 +108,8 @@ enum Instruction {
     IncData(u64),
     DecData(u64),
 
-    Emit(u64),   // adds len to both thin and data
+    Len(u64),
+    Emit,        // adds len to both thin and data
     NewReg(i64), // Pushes a new reg which becomes the new reg[0], payload is the new time delta
     SwitchReg(u64),
     Shift(u8),
@@ -167,7 +168,7 @@ impl InstrStream {
     fn write_instr(&mut self, instr: &Instruction, comment: Option<String>) -> Result<()> {
         use Instruction::*;
 
-        assert!(*instr != Emit(0));
+        assert!(*instr != Len(0));
 
         let start_len = self.bits_written;
         let i_code;
@@ -178,56 +179,60 @@ impl InstrStream {
                 data,
                 snap_time,
             } => {
-                self.write_bits(8, 0b1000_0000)?;
+                self.write_bits(9, 0b1010_0001_1)?;
                 self.write_varint(*thin)?;
                 self.write_varint(*data)?;
                 self.write_varint(*snap_time as u64)?;
                 i_code = 0;
             }
             IncThin(delta) => {
-                self.write_bits(6, 0b1000_01)?;
+                self.write_bits(7, 0b1010_001)?;
                 self.write_varint(*delta)?;
                 i_code = 1;
             }
             DecThin(delta) => {
-                self.write_bits(8, 0b1000_0001)?;
+                self.write_bits(9, 0b1010_0001_0)?;
                 self.write_varint(*delta)?;
                 i_code = 2;
             }
             IncData(delta) => {
-                self.write_bits(1, 0b0)?;
+                self.write_bits(2, 0b01)?;
                 self.write_varint(*delta)?;
                 i_code = 3;
             }
             DecData(delta) => {
-                self.write_bits(4, 0b1001)?;
+                self.write_bits(5, 0b1010_1)?;
                 self.write_varint(*delta)?;
                 i_code = 4;
             }
-            Emit(len) => {
-                self.write_bits(2, 0b11)?;
+            Len(len) => {
+                self.write_bits(3, 0b100)?; // FIXME: garbage until we rerun huffman encoder
                 self.write_varint(*len)?;
+                i_code = 10;
+            }
+            Emit => {
+                self.write_bits(2, 0b11)?;
                 i_code = 5;
             }
             NewReg(delta_time) => {
-                self.write_bits(6, 0b1000_01)?;
+                self.write_bits(4, 0b1011)?;
                 self.write_signed_varint(*delta_time)?;
                 i_code = 6;
             }
             SwitchReg(reg) => {
                 assert!(*reg < 16);
-                self.write_bits(3, 0b101)?;
+                self.write_bits(2, 0b00)?;
                 self.write_bits(4, *reg as u32)?;
                 i_code = 7;
             }
             Shift(count) => {
-                assert!(*count < 8);
-                self.write_bits(5, 0b1000_1)?;
-                self.write_bits(3, *count as u32)?;
+                //assert!(*count < 8);
+                self.write_bits(6, 0b1010_01)?;
+                self.write_varint(*count as u64)?;
                 i_code = 8;
             }
             Halt => {
-                self.write_bits(8, 0)?;
+                self.write_bits(8, 0b1010_0000)?;
                 i_code = 9;
             }
         }
@@ -253,8 +258,10 @@ impl InstrStream {
         Ok(())
     }
 
-    fn complete(self) -> BTreeMap<u8, InstrStats> {
-        self.instr_stats
+    fn complete(mut self) -> (Vec<u8>, BTreeMap<u8, InstrStats>) {
+        self.writer.byte_align();
+        self.writer.flush();
+        (self.writer.into_writer(), self.instr_stats)
     }
 }
 
@@ -285,7 +292,7 @@ pub struct Packer {
 impl Default for Packer {
     fn default() -> Self {
         Self {
-            debug: false,
+            debug: true,
             mappings: VecDeque::new(),
             nr_nodes: 0,
             nr_mapped_blocks: 0,
@@ -325,7 +332,8 @@ fn format_instr(instr: &Instruction) -> String {
         IncData(delta) => format!("data +{}", delta),
         DecData(delta) => format!("data -{}", delta),
 
-        Emit(len) => format!("emit {}", len), // adds len to both thin and data
+        Len(len) => format!("len {}", len),
+        Emit => format!("emit"), // adds len to both thin and data
         NewReg(time) => format!("push {:+}", time), // Pushes a new reg which becomes the new reg[0]
         SwitchReg(reg) => format!("reg {}", reg),
         Shift(count) => format!("shift {}", count),
@@ -349,6 +357,7 @@ impl Packer {
         let mut reg = 0;
         let mut regs = VecDeque::new();
         let mut current_thin = 0;
+        let mut current_len = 0;
         let mut shift = 0;
         let mut last_shift = 0;
         if let Some(m) = self.mappings.pop_front() {
@@ -360,7 +369,9 @@ impl Packer {
                 },
                 None,
             )?;
-            w.write_instr(&Emit(m.len >> shift), None)?;
+            w.write_instr(&Len(m.len >> shift), None)?;
+            current_len = m.len;
+            w.write_instr(&Emit, None)?;
 
             current_thin = m.thin_begin + m.len;
             regs.push_front(Register {
@@ -425,6 +436,11 @@ impl Packer {
                 regs[reg].data = m.data_begin;
             }
 
+            if current_len != m.len {
+                w.write_instr(&Len(m.len >> shift), None)?;
+                current_len = m.len;
+            }
+
             current_thin += m.len;
             regs[reg].data += m.len;
 
@@ -433,10 +449,10 @@ impl Packer {
                     "thin={}, data={}, time={}, len={}",
                     m.thin_begin, m.data_begin, m.time, m.len
                 );
-                w.write_instr(&Emit(m.len >> shift), Some(comment))?;
+                w.write_instr(&Emit, Some(comment))?;
                 println!("");
             } else {
-                w.write_instr(&Emit(m.len >> shift), None)?;
+                w.write_instr(&Emit, None)?;
             }
 
             nr_entries += 1;
@@ -448,7 +464,7 @@ impl Packer {
         }
         w.write_instr(&Halt, None)?;
 
-        let stats = w.complete();
+        let (bytes, stats) = w.complete();
 
         // Merge stats into self.instr_stats
         for (instr, new_stats) in stats {
@@ -466,8 +482,8 @@ impl Packer {
         self.nr_mapped_blocks += nr_mapped_blocks;
 
         // use zstd::bulk::compress;
-        // let compressed = compress(&w, 0)?;
-        // println!("len = {}, compressed = {}", w.len(), compressed.len());
+        // let compressed = compress(&bytes, 0)?;
+        // println!("len = {}, compressed = {}", bytes.len(), compressed.len());
 
         Ok(())
     }
@@ -518,6 +534,7 @@ impl Packer {
             7 => "switch reg",
             8 => "shift     ",
             9 => "halt      ",
+            10 => "len       ",
             _ => panic!("unknown instruction"),
         }
     }
@@ -547,11 +564,11 @@ impl Packer {
         instr_stats.sort_by(|a, b| b.1.total_bits.cmp(&a.1.total_bits));
         for (instr, stats) in instr_stats {
             println!(
-                "{:16}: count {:8}, mean bytes {:6.2}, total bytes {:10}",
+                "{:16}: count {:8}, mean bits {:6.1}, total bytes {:10}",
                 Self::instr_name(*instr),
                 stats.count,
-                stats.total_bits as f64 / (8.0 * stats.count as f64),
-                stats.total_bits as f64 / 8.0
+                stats.total_bits as f64 / (stats.count as f64),
+                (stats.total_bits as f64 / 8.0) as u64
             );
         }
     }
