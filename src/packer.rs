@@ -123,12 +123,12 @@ struct InstrStream {
 }
 
 impl InstrStream {
-    fn new() -> Self {
+    fn new(debug: bool) -> Self {
         Self {
             bits_written: 0,
             writer: BitWriter::endian(Vec::new(), BigEndian),
             instr_stats: BTreeMap::new(),
-            debug: false,
+            debug,
         }
     }
 
@@ -252,6 +252,10 @@ impl InstrStream {
 
         Ok(())
     }
+
+    fn complete(self) -> BTreeMap<u8, InstrStats> {
+        self.instr_stats
+    }
 }
 
 //------------------------------------------
@@ -337,7 +341,7 @@ impl Packer {
 
         let header_size = 32;
 
-        let mut w = InstrStream::new();
+        let mut w = InstrStream::new(self.debug);
         let mut nr_entries = 0;
         let mut nr_mapped_blocks = 0;
 
@@ -443,6 +447,18 @@ impl Packer {
             }
         }
         w.write_instr(&Halt, None)?;
+
+        let stats = w.complete();
+
+        // Merge stats into self.instr_stats
+        for (instr, new_stats) in stats {
+            let entry = self.instr_stats.entry(instr).or_insert(InstrStats {
+                count: 0,
+                total_bits: 0,
+            });
+            entry.count += new_stats.count;
+            entry.total_bits += new_stats.total_bits;
+        }
 
         // increment the entry count bucket with nr_entries
         *self.entry_counts.entry(nr_entries).or_insert(0) += 1;
