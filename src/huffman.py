@@ -1,17 +1,18 @@
 import heapq
 
 instructions = [
-    ("key frame", 10536),
-    ("inc thin", 81560),
-    ("dec thin", 6995),
-    ("inc data", 9496117),
-    ("dec data", 2048855),
-    ("len", 5139527),
-    ("emit", 13062753),
-    ("new reg", 2596316),
-    ("switch reg", 5708985),
-    ("shift", 419490),
-    ("halt", 10536),
+    ("key frame", 691),
+    ("inc thin", 22602),
+    ("dec thin", 3650),
+    ("inc data", 861029),
+    ("dec data", 127048),
+    ("len", 180056),
+    ("len small", 350116),
+    ("emit", 1014670),
+    ("new reg", 13938),
+    ("switch reg", 240558),
+    ("shift", 41975),
+    ("halt", 691),
 ]
 
 
