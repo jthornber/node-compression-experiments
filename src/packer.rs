@@ -119,16 +119,26 @@ enum Instruction {
 
 struct InstrStream {
     bits_written: usize,
-    writer: BitWriter<Vec<u8>, BigEndian>,
+    opcode_writer: BitWriter<Vec<u8>, BigEndian>,
+    arg_writer: BitWriter<Vec<u8>, BigEndian>,
     instr_stats: BTreeMap<u8, InstrStats>,
     debug: bool,
 }
+
+#[derive(Copy, Clone)]
+enum Stream {
+    OPCODE,
+    ARGS,
+}
+
+use Stream::*;
 
 impl InstrStream {
     fn new(debug: bool) -> Self {
         Self {
             bits_written: 0,
-            writer: BitWriter::endian(Vec::new(), BigEndian),
+            opcode_writer: BitWriter::endian(Vec::new(), BigEndian),
+            arg_writer: BitWriter::endian(Vec::new(), BigEndian),
             instr_stats: BTreeMap::new(),
             debug,
         }
@@ -138,69 +148,38 @@ impl InstrStream {
         (self.bits_written + 7) / 8
     }
 
-    fn write_bits(&mut self, bits: u32, value: u32) -> Result<()> {
-        self.writer.write(bits, value)?;
+    fn write_bits(&mut self, bits: u32, value: u32, stream: Stream) -> Result<()> {
+        match stream {
+            OPCODE => {
+                self.opcode_writer.write(bits, value)?;
+            }
+            ARGS => {
+                self.arg_writer.write(bits, value)?;
+            }
+        }
+
         self.bits_written += bits as usize;
         Ok(())
     }
 
-    fn write_varint_(&mut self, v: u64) -> Result<()> {
-        // FIXME: many operands can't be 0
-        let v = v - 1;
-
-        if v <= 1 {
-            // 1-bit prefix 0, followed by 1 bit (0-1)
-            self.write_bits(1, 0)?;
-            self.write_bits(1, v as u32)?;
-        } else if v <= 5 {
-            // 2-bit prefix 10, followed by 2 bits (2-5)
-            self.write_bits(2, 0b10)?;
-            self.write_bits(2, (v - 2) as u32)?;
-        } else if v <= 21 {
-            // 3-bit prefix 110, followed by 4 bits (6-21)
-            self.write_bits(3, 0b110)?;
-            self.write_bits(4, (v - 6) as u32)?;
-        } else if v <= 277 {
-            // 4-bit prefix 1110, followed by 8 bits (22-277)
-            self.write_bits(4, 0b1110)?;
-            self.write_bits(8, (v - 22) as u32)?;
-        } else if v <= 65813 {
-            // 5-bit prefix 11110, followed by 16 bits (278-65813)
-            self.write_bits(5, 0b11110)?;
-            self.write_bits(16, (v - 278) as u32)?;
-        } else {
-            // 5-bit prefix 11111, followed by standard varint encoding
-            self.write_bits(5, 0b11111)?;
-            let mut value = v;
-            while value > 0x7F {
-                self.write_bits(8, ((value & 0x7f) | 0x80) as u32)?;
-                value >>= 7;
-            }
-            self.write_bits(8, value as u32)?;
-        }
-        Ok(())
-    }
-
-    fn write_varint(&mut self, mut v: u64) -> Result<()> {
+    fn write_varint(&mut self, mut v: u64, stream: Stream) -> Result<()> {
         if v < 16 {
-            return self.write_bits(5, v as u32);
+            return self.write_bits(5, v as u32, stream);
         } else {
-            self.write_bits(1, 1)?;
-            // self.write_bits(5, 0b10000 | (v & 0b1111) as u32)?;
-            // v >>= 4;
+            self.write_bits(1, 1, stream)?;
         }
 
         while v > 0x7F {
-            self.write_bits(8, ((v & 0x7f) | 0x80) as u32)?;
+            self.write_bits(8, ((v & 0x7f) | 0x80) as u32, stream)?;
             v >>= 7;
         }
-        self.write_bits(8, v as u32)?;
+        self.write_bits(8, v as u32, stream)?;
         Ok(())
     }
 
-    fn write_signed_varint(&mut self, v: i64) -> Result<()> {
-        self.write_bits(1, if v < 0 { 1 } else { 0 })?;
-        self.write_varint(v.abs() as u64)?;
+    fn write_signed_varint(&mut self, v: i64, stream: Stream) -> Result<()> {
+        self.write_bits(1, if v < 0 { 1 } else { 0 }, stream)?;
+        self.write_varint(v.abs() as u64, stream)?;
         Ok(())
     }
 
@@ -230,68 +209,68 @@ impl InstrStream {
                 data,
                 snap_time,
             } => {
-                self.write_bits(10, 0b1101_0000_01)?;
-                self.write_varint(*thin)?;
-                self.write_varint(*data)?;
-                self.write_varint(*snap_time as u64)?;
+                self.write_bits(10, 0b1101_0000_01, OPCODE)?;
+                self.write_varint(*thin, ARGS)?;
+                self.write_varint(*data, ARGS)?;
+                self.write_varint(*snap_time as u64, ARGS)?;
                 i_code = 0;
             }
             IncThin(delta) => {
-                self.write_bits(7, 0b1101_001)?;
-                self.write_varint(*delta)?;
+                self.write_bits(7, 0b1101_001, OPCODE)?;
+                self.write_varint(*delta, ARGS)?;
                 i_code = 1;
             }
             DecThin(delta) => {
-                self.write_bits(9, 0b1101_0000_1)?;
-                self.write_varint(*delta)?;
+                self.write_bits(9, 0b1101_0000_1, OPCODE)?;
+                self.write_varint(*delta, ARGS)?;
                 i_code = 2;
             }
             IncData(delta) => {
-                self.write_bits(2, 0b10)?;
-                self.write_varint(*delta)?;
+                self.write_bits(2, 0b10, OPCODE)?;
+                self.write_varint(*delta, ARGS)?;
                 i_code = 3;
             }
             DecData(delta) => {
-                self.write_bits(5, 0b1101_1)?;
-                self.write_varint(*delta)?;
+                self.write_bits(5, 0b1101_1, OPCODE)?;
+                self.write_varint(*delta, ARGS)?;
                 i_code = 4;
             }
 
             Len(len) => {
-                self.write_bits(4, 0b1100)?;
-                self.write_varint(*len)?;
+                self.write_bits(4, 0b1100, OPCODE)?;
+                self.write_varint(*len, ARGS)?;
                 i_code = 10;
             }
             LenSmall(len) => {
                 assert!(*len < 4);
-                self.write_bits(4, 0b1111)?;
-                self.write_bits(2, *len as u32)?;
+                self.write_bits(4, 0b1111, OPCODE)?;
+                self.write_bits(2, *len as u32, ARGS)?;
                 i_code = 11;
             }
 
             Emit => {
-                self.write_bits(1, 0b0)?;
+                self.write_bits(1, 0b0, OPCODE)?;
                 i_code = 5;
             }
             NewReg(delta_time) => {
-                self.write_bits(8, 0b1101_0001)?;
-                self.write_signed_varint(*delta_time)?;
+                self.write_bits(8, 0b1101_0001, OPCODE)?;
+                self.write_signed_varint(*delta_time, ARGS)?;
                 i_code = 6;
             }
             SwitchReg(reg) => {
                 assert!(*reg < 16);
-                self.write_bits(4, 0b1110)?;
-                self.write_bits(4, *reg as u32)?;
+                self.write_bits(4, 0b1110, OPCODE)?;
+                self.write_bits(4, *reg as u32, ARGS)?;
                 i_code = 7;
             }
             Shift(count) => {
                 //assert!(*count < 8);
-                self.write_bits(6, 0b1101_01)?;
-                self.write_varint(*count as u64)?;
+                self.write_bits(6, 0b1101_01, OPCODE)?;
+                self.write_varint(*count as u64, ARGS)?;
                 i_code = 8;
             }
             Halt => {
-                self.write_bits(10, 0b1101_0000_00)?;
+                self.write_bits(10, 0b1101_0000_00, OPCODE)?;
                 i_code = 9;
             }
         }
@@ -317,10 +296,17 @@ impl InstrStream {
         Ok(())
     }
 
-    fn complete(mut self) -> (Vec<u8>, BTreeMap<u8, InstrStats>) {
-        self.writer.byte_align();
-        self.writer.flush();
-        (self.writer.into_writer(), self.instr_stats)
+    fn complete(mut self) -> (Vec<u8>, Vec<u8>, BTreeMap<u8, InstrStats>) {
+        self.opcode_writer.byte_align();
+        self.opcode_writer.flush();
+
+        self.arg_writer.byte_align();
+        self.arg_writer.flush();
+        (
+            self.opcode_writer.into_writer(),
+            self.arg_writer.into_writer(),
+            self.instr_stats,
+        )
     }
 }
 
@@ -351,7 +337,7 @@ pub struct Packer {
 impl Default for Packer {
     fn default() -> Self {
         Self {
-            debug: true,
+            debug: false,
             mappings: VecDeque::new(),
             nr_nodes: 0,
             nr_mapped_blocks: 0,
@@ -529,7 +515,7 @@ impl Packer {
         }
         w.write_instr(&Halt, None)?;
 
-        let (bytes, stats) = w.complete();
+        let (opcode_bytes, arg_bytes, stats) = w.complete();
 
         // Merge stats into self.instr_stats
         for (instr, new_stats) in stats {
@@ -606,7 +592,7 @@ impl Packer {
     }
 
     pub fn print_results(&self) {
-        println!("Nr mapped blocks: {}", self.nr_mapped_blocks);
+        println!("Nr mapped blocks: {}", self.nr_mapped_blocks / 8);
         println!(
             "Total number of nodes: {} ({:.2} meg)",
             self.nr_nodes,
