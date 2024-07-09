@@ -109,6 +109,7 @@ enum Instruction {
     DecData(u64),
 
     Len(u64),
+    LenSmall(u8),
     Emit,        // adds len to both thin and data
     NewReg(i64), // Pushes a new reg which becomes the new reg[0], payload is the new time delta
     SwitchReg(u64),
@@ -143,12 +144,50 @@ impl InstrStream {
         Ok(())
     }
 
-    fn write_varint(&mut self, mut v: u64) -> Result<()> {
-        if v < 8 {
-            return self.write_bits(4, v as u32);
+    fn write_varint_(&mut self, v: u64) -> Result<()> {
+        // FIXME: many operands can't be 0
+        let v = v - 1;
+
+        if v <= 1 {
+            // 1-bit prefix 0, followed by 1 bit (0-1)
+            self.write_bits(1, 0)?;
+            self.write_bits(1, v as u32)?;
+        } else if v <= 5 {
+            // 2-bit prefix 10, followed by 2 bits (2-5)
+            self.write_bits(2, 0b10)?;
+            self.write_bits(2, (v - 2) as u32)?;
+        } else if v <= 21 {
+            // 3-bit prefix 110, followed by 4 bits (6-21)
+            self.write_bits(3, 0b110)?;
+            self.write_bits(4, (v - 6) as u32)?;
+        } else if v <= 277 {
+            // 4-bit prefix 1110, followed by 8 bits (22-277)
+            self.write_bits(4, 0b1110)?;
+            self.write_bits(8, (v - 22) as u32)?;
+        } else if v <= 65813 {
+            // 5-bit prefix 11110, followed by 16 bits (278-65813)
+            self.write_bits(5, 0b11110)?;
+            self.write_bits(16, (v - 278) as u32)?;
         } else {
-            self.write_bits(4, 0b1000 | (v & 0xf) as u32)?;
-            v >>= 3;
+            // 5-bit prefix 11111, followed by standard varint encoding
+            self.write_bits(5, 0b11111)?;
+            let mut value = v;
+            while value > 0x7F {
+                self.write_bits(8, ((value & 0x7f) | 0x80) as u32)?;
+                value >>= 7;
+            }
+            self.write_bits(8, value as u32)?;
+        }
+        Ok(())
+    }
+
+    fn write_varint(&mut self, mut v: u64) -> Result<()> {
+        if v < 16 {
+            return self.write_bits(5, v as u32);
+        } else {
+            self.write_bits(1, 1)?;
+            // self.write_bits(5, 0b10000 | (v & 0b1111) as u32)?;
+            // v >>= 4;
         }
 
         while v > 0x7F {
@@ -173,66 +212,86 @@ impl InstrStream {
         let start_len = self.bits_written;
         let i_code;
 
+        // emit: 0
+        // inc data: 10
+        // len: 1100
+        // len small: 1111
+        // switch reg: 1110
+        // dec data: 11011
+        // shift: 110101
+        // inc thin: 1101001
+        // new reg: 11010001
+        // dec thin: 110100001
+        // halt: 1101000000
+        // key frame: 1101000001
         match instr {
             SetKeyframe {
                 thin,
                 data,
                 snap_time,
             } => {
-                self.write_bits(9, 0b1010_0001_1)?;
+                self.write_bits(10, 0b1101_0000_01)?;
                 self.write_varint(*thin)?;
                 self.write_varint(*data)?;
                 self.write_varint(*snap_time as u64)?;
                 i_code = 0;
             }
             IncThin(delta) => {
-                self.write_bits(7, 0b1010_001)?;
+                self.write_bits(7, 0b1101_001)?;
                 self.write_varint(*delta)?;
                 i_code = 1;
             }
             DecThin(delta) => {
-                self.write_bits(9, 0b1010_0001_0)?;
+                self.write_bits(9, 0b1101_0000_1)?;
                 self.write_varint(*delta)?;
                 i_code = 2;
             }
             IncData(delta) => {
-                self.write_bits(2, 0b01)?;
+                self.write_bits(2, 0b10)?;
                 self.write_varint(*delta)?;
                 i_code = 3;
             }
             DecData(delta) => {
-                self.write_bits(5, 0b1010_1)?;
+                self.write_bits(5, 0b1101_1)?;
                 self.write_varint(*delta)?;
                 i_code = 4;
             }
+
             Len(len) => {
-                self.write_bits(3, 0b100)?; // FIXME: garbage until we rerun huffman encoder
+                self.write_bits(4, 0b1100)?;
                 self.write_varint(*len)?;
                 i_code = 10;
             }
+            LenSmall(len) => {
+                assert!(*len < 4);
+                self.write_bits(4, 0b1111)?;
+                self.write_bits(2, *len as u32)?;
+                i_code = 11;
+            }
+
             Emit => {
-                self.write_bits(2, 0b11)?;
+                self.write_bits(1, 0b0)?;
                 i_code = 5;
             }
             NewReg(delta_time) => {
-                self.write_bits(4, 0b1011)?;
+                self.write_bits(8, 0b1101_0001)?;
                 self.write_signed_varint(*delta_time)?;
                 i_code = 6;
             }
             SwitchReg(reg) => {
                 assert!(*reg < 16);
-                self.write_bits(2, 0b00)?;
+                self.write_bits(4, 0b1110)?;
                 self.write_bits(4, *reg as u32)?;
                 i_code = 7;
             }
             Shift(count) => {
                 //assert!(*count < 8);
-                self.write_bits(6, 0b1010_01)?;
+                self.write_bits(6, 0b1101_01)?;
                 self.write_varint(*count as u64)?;
                 i_code = 8;
             }
             Halt => {
-                self.write_bits(8, 0b1010_0000)?;
+                self.write_bits(10, 0b1101_0000_00)?;
                 i_code = 9;
             }
         }
@@ -333,6 +392,7 @@ fn format_instr(instr: &Instruction) -> String {
         DecData(delta) => format!("data -{}", delta),
 
         Len(len) => format!("len {}", len),
+        LenSmall(len) => format!("len {}", len),
         Emit => format!("emit"), // adds len to both thin and data
         NewReg(time) => format!("push {:+}", time), // Pushes a new reg which becomes the new reg[0]
         SwitchReg(reg) => format!("reg {}", reg),
@@ -437,7 +497,12 @@ impl Packer {
             }
 
             if current_len != m.len {
-                w.write_instr(&Len(m.len >> shift), None)?;
+                let len = m.len >> shift;
+                if len < 4 {
+                    w.write_instr(&LenSmall(len as u8), None)?;
+                } else {
+                    w.write_instr(&Len(m.len >> shift), None)?;
+                }
                 current_len = m.len;
             }
 
@@ -535,6 +600,7 @@ impl Packer {
             8 => "shift     ",
             9 => "halt      ",
             10 => "len       ",
+            11 => "len small ",
             _ => panic!("unknown instruction"),
         }
     }
