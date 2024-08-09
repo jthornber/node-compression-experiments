@@ -54,47 +54,11 @@ fn test_u64_sub_to_i64() {
 
 //------------------------------------------
 
-pub fn zigzag_encode(n: i64) -> u64 {
-    ((n << 1) ^ (n >> 63)) as u64
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
+enum Sign {
+    PLUS,
+    MINUS,
 }
-
-pub fn zigzag_decode(n: u64) -> i64 {
-    ((n >> 1) as i64) ^ (-(n as i64 & 1))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_zigzag_codec() {
-        let test_cases = [
-            0,
-            1,
-            -1,
-            2,
-            -2,
-            i64::MAX,
-            i64::MIN,
-            i64::MAX - 1,
-            i64::MIN + 1,
-            1234567,
-            -1234567,
-        ];
-
-        for &value in &test_cases {
-            let encoded = zigzag_encode(value);
-            let decoded = zigzag_decode(encoded);
-            assert_eq!(value, decoded, "ZigZag codec failed for value: {}", value);
-        }
-    }
-}
-
-//------------------------------------------
-
-type BitStream = BitWriter<Vec<u8>, BigEndian>;
-
-//------------------------------------------
 
 #[derive(Debug, Ord, PartialOrd, PartialEq, Eq)]
 enum Instruction {
@@ -103,18 +67,88 @@ enum Instruction {
         data: u64,
         snap_time: u32,
     },
-    IncThin(u64),
-    DecThin(u64), // shouldn't need this in the real thing
-    IncData(u64),
-    DecData(u64),
-
-    Len(u64),
-    LenSmall(u8),
-    Emit,        // adds len to both thin and data
-    NewReg(i64), // Pushes a new reg which becomes the new reg[0], payload is the new time delta
-    SwitchReg(u64),
+    NewReg(Sign, u64), // Pushes a new reg which becomes the new reg[0], payload is the new time delta
     Shift(u8),
+    Repeat(u64),
     Halt,
+
+    // These get represented as bits within the emit instr
+    SwitchReg(u64),
+    DeltaThin(Sign, u64),
+    DeltaData(Sign, u64),
+    Len(u64),
+    Emit, // adds len to both thin and data
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ISet {
+    switch_reg: bool,
+    delta_thin: bool,
+    delta_data: bool,
+    len: bool,
+}
+
+impl ISet {
+    fn new() -> Self {
+        Self {
+            switch_reg: false,
+            delta_thin: false,
+            delta_data: false,
+            len: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.switch_reg = false;
+        self.delta_thin = false;
+        self.delta_data = false;
+        self.len = false;
+    }
+}
+
+struct ISetAggregator {
+    last: ISet,
+    count: usize,
+}
+
+impl ISetAggregator {
+    fn new() -> Self {
+        Self {
+            last: ISet::new(),
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, iset: &ISet) -> Option<(usize, ISet)> {
+        if self.count > 0 {
+            if *iset == self.last {
+                self.count += 1;
+                None
+            } else {
+                let mut last = iset.clone();
+                std::mem::swap(&mut self.last, &mut last);
+                let count = self.count;
+                self.count = 1;
+                Some((count, last))
+            }
+        } else {
+            self.last = *iset;
+            self.count = 1;
+            None
+        }
+    }
+
+    fn complete(&mut self) -> Option<(usize, ISet)> {
+        if self.count > 0 {
+            let count = self.count;
+            let mut last = ISet::new();
+            std::mem::swap(&mut self.last, &mut last);
+            self.count = 0;
+            Some((count, last))
+        } else {
+            None
+        }
+    }
 }
 
 struct InstrStream {
@@ -122,6 +156,10 @@ struct InstrStream {
     opcode_writer: BitWriter<Vec<u8>, BigEndian>,
     arg_writer: BitWriter<Vec<u8>, BigEndian>,
     instr_stats: BTreeMap<u8, InstrStats>,
+
+    iset: ISet,
+    isets: ISetAggregator,
+
     debug: bool,
 }
 
@@ -140,6 +178,10 @@ impl InstrStream {
             opcode_writer: BitWriter::endian(Vec::new(), BigEndian),
             arg_writer: BitWriter::endian(Vec::new(), BigEndian),
             instr_stats: BTreeMap::new(),
+
+            iset: ISet::new(),
+            isets: ISetAggregator::new(),
+
             debug,
         }
     }
@@ -177,9 +219,27 @@ impl InstrStream {
         Ok(())
     }
 
-    fn write_signed_varint(&mut self, v: i64, stream: Stream) -> Result<()> {
-        self.write_bits(1, if v < 0 { 1 } else { 0 }, stream)?;
-        self.write_varint(v.abs() as u64, stream)?;
+    fn write_signed_varint(&mut self, sign: Sign, v: u64, stream: Stream) -> Result<()> {
+        self.write_bits(1, sign as u32, stream)?;
+        self.write_varint(v, stream)?;
+        Ok(())
+    }
+
+    fn emit_(&mut self, count: usize, iset: &ISet) -> Result<()> {
+        assert!(count != 0);
+
+        // println!("count {}, iset {:?}", count, iset);
+        if count > 1 {
+            self.write_bits(3, 0b110, OPCODE)?;
+            self.write_varint(count as u64, ARGS)?;
+        }
+
+        self.write_bits(1, 0b0, OPCODE)?;
+        self.write_bits(1, iset.switch_reg as u32, OPCODE)?;
+        self.write_bits(1, iset.delta_thin as u32, OPCODE)?;
+        self.write_bits(1, iset.delta_data as u32, OPCODE)?;
+        self.write_bits(1, iset.len as u32, OPCODE)?;
+
         Ok(())
     }
 
@@ -191,86 +251,67 @@ impl InstrStream {
         let start_len = self.bits_written;
         let i_code;
 
-        // emit: 0
-        // inc data: 10
-        // len: 1100
-        // len small: 1111
-        // switch reg: 1110
-        // dec data: 11011
-        // shift: 110101
-        // inc thin: 1101001
-        // new reg: 11010001
-        // dec thin: 110100001
-        // halt: 1101000000
-        // key frame: 1101000001
         match instr {
             SetKeyframe {
                 thin,
                 data,
                 snap_time,
             } => {
-                self.write_bits(10, 0b1101_0000_01, OPCODE)?;
+                self.write_bits(4, 0b1111, OPCODE)?;
                 self.write_varint(*thin, ARGS)?;
                 self.write_varint(*data, ARGS)?;
                 self.write_varint(*snap_time as u64, ARGS)?;
                 i_code = 0;
             }
-            IncThin(delta) => {
-                self.write_bits(7, 0b1101_001, OPCODE)?;
-                self.write_varint(*delta, ARGS)?;
+            DeltaThin(sign, delta) => {
+                self.write_signed_varint(*sign, *delta, ARGS)?;
+                self.iset.delta_thin = true;
                 i_code = 1;
             }
-            DecThin(delta) => {
-                self.write_bits(9, 0b1101_0000_1, OPCODE)?;
-                self.write_varint(*delta, ARGS)?;
+            DeltaData(sign, delta) => {
+                self.write_signed_varint(*sign, *delta, ARGS)?;
+                self.iset.delta_data = true;
                 i_code = 2;
-            }
-            IncData(delta) => {
-                self.write_bits(2, 0b10, OPCODE)?;
-                self.write_varint(*delta, ARGS)?;
-                i_code = 3;
-            }
-            DecData(delta) => {
-                self.write_bits(5, 0b1101_1, OPCODE)?;
-                self.write_varint(*delta, ARGS)?;
-                i_code = 4;
             }
 
             Len(len) => {
-                self.write_bits(4, 0b1100, OPCODE)?;
                 self.write_varint(*len, ARGS)?;
-                i_code = 10;
-            }
-            LenSmall(len) => {
-                assert!(*len < 4);
-                self.write_bits(4, 0b1111, OPCODE)?;
-                self.write_bits(2, *len as u32, ARGS)?;
-                i_code = 11;
+                self.iset.len = true;
+                i_code = 3;
             }
 
             Emit => {
-                self.write_bits(1, 0b0, OPCODE)?;
-                i_code = 5;
+                if let Some((count, iset)) = self.isets.push(&self.iset) {
+                    self.emit_(count, &iset)?;
+                }
+
+                self.iset.clear();
+
+                i_code = 4;
             }
-            NewReg(delta_time) => {
-                self.write_bits(8, 0b1101_0001, OPCODE)?;
-                self.write_signed_varint(*delta_time, ARGS)?;
-                i_code = 6;
+            NewReg(sign, delta_time) => {
+                self.write_bits(3, 0b100, OPCODE)?;
+                self.write_signed_varint(*sign, *delta_time, ARGS)?;
+                i_code = 5;
             }
             SwitchReg(reg) => {
                 assert!(*reg < 16);
-                self.write_bits(4, 0b1110, OPCODE)?;
                 self.write_bits(4, *reg as u32, ARGS)?;
-                i_code = 7;
+                self.iset.switch_reg = true;
+                i_code = 6;
             }
             Shift(count) => {
-                //assert!(*count < 8);
-                self.write_bits(6, 0b1101_01, OPCODE)?;
+                self.write_bits(3, 0b101, OPCODE)?;
                 self.write_varint(*count as u64, ARGS)?;
-                i_code = 8;
+                i_code = 7;
             }
             Halt => {
-                self.write_bits(10, 0b1101_0000_00, OPCODE)?;
+                self.write_bits(4, 0b1110, OPCODE)?;
+                i_code = 8;
+            }
+            Repeat(count) => {
+                self.write_bits(3, 0b110, OPCODE)?;
+                self.write_varint(*count as u64, ARGS)?;
                 i_code = 9;
             }
         }
@@ -296,17 +337,21 @@ impl InstrStream {
         Ok(())
     }
 
-    fn complete(mut self) -> (Vec<u8>, Vec<u8>, BTreeMap<u8, InstrStats>) {
+    fn complete(mut self) -> Result<(Vec<u8>, Vec<u8>, BTreeMap<u8, InstrStats>)> {
+        if let Some((count, iset)) = self.isets.complete() {
+            self.emit_(count, &iset)?;
+        }
+
         self.opcode_writer.byte_align();
         self.opcode_writer.flush();
 
         self.arg_writer.byte_align();
         self.arg_writer.flush();
-        (
+        Ok((
             self.opcode_writer.into_writer(),
             self.arg_writer.into_writer(),
             self.instr_stats,
-        )
+        ))
     }
 }
 
@@ -372,18 +417,19 @@ fn format_instr(instr: &Instruction) -> String {
             data,
             snap_time,
         } => format!("keyframe {}, {}, {}", thin, data, snap_time),
-        IncThin(delta) => format!("thin +{}", delta),
-        DecThin(delta) => format!("thin -{}", delta),
-        IncData(delta) => format!("data +{}", delta),
-        DecData(delta) => format!("data -{}", delta),
+        DeltaThin(Sign::PLUS, delta) => format!("thin +{}", delta),
+        DeltaThin(Sign::MINUS, delta) => format!("thin -{}", delta),
+        DeltaData(Sign::PLUS, delta) => format!("data +{}", delta),
+        DeltaData(Sign::MINUS, delta) => format!("data -{}", delta),
 
         Len(len) => format!("len {}", len),
-        LenSmall(len) => format!("len {}", len),
         Emit => format!("emit"), // adds len to both thin and data
-        NewReg(time) => format!("push {:+}", time), // Pushes a new reg which becomes the new reg[0]
+        NewReg(Sign::PLUS, time) => format!("push +{}", time), // Pushes a new reg which becomes the new reg[0]
+        NewReg(Sign::MINUS, time) => format!("push -{}", time), // Pushes a new reg which becomes the new reg[0]
         SwitchReg(reg) => format!("reg {}", reg),
         Shift(count) => format!("shift {}", count),
         Halt => format!("halt"),
+        Repeat(count) => format!("repeat {}", count),
     }
 }
 
@@ -439,9 +485,15 @@ impl Packer {
             }
             if current_thin != m.thin_begin {
                 if m.thin_begin > current_thin {
-                    w.write_instr(&IncThin((m.thin_begin - current_thin) >> shift), None)?;
+                    w.write_instr(
+                        &DeltaThin(Sign::PLUS, (m.thin_begin - current_thin) >> shift),
+                        None,
+                    )?;
                 } else {
-                    w.write_instr(&DecThin((current_thin - m.thin_begin) >> shift), None)?
+                    w.write_instr(
+                        &DeltaThin(Sign::MINUS, (current_thin - m.thin_begin) >> shift),
+                        None,
+                    )?
                 }
                 current_thin = m.thin_begin;
             }
@@ -460,10 +512,17 @@ impl Packer {
                     w.write_instr(&SwitchReg(new_reg as u64), None)?;
                     reg = new_reg;
                 } else {
-                    w.write_instr(
-                        &NewReg(u64_sub_to_i64(m.time as u64, regs[reg].snap_time as u64)),
-                        None,
-                    )?;
+                    if m.time > regs[reg].snap_time {
+                        w.write_instr(
+                            &NewReg(Sign::PLUS, m.time as u64 - regs[reg].snap_time as u64),
+                            None,
+                        )?;
+                    } else {
+                        w.write_instr(
+                            &NewReg(Sign::MINUS, regs[reg].snap_time as u64 - m.time as u64),
+                            None,
+                        )?;
+                    }
                     regs.push_front(regs[reg].clone());
                     if regs.len() > 16 {
                         regs.pop_back();
@@ -475,20 +534,22 @@ impl Packer {
 
             if regs[reg].data != m.data_begin {
                 if m.data_begin > regs[reg].data {
-                    w.write_instr(&IncData((m.data_begin - regs[reg].data) >> shift), None)?;
+                    w.write_instr(
+                        &DeltaData(Sign::PLUS, (m.data_begin - regs[reg].data) >> shift),
+                        None,
+                    )?;
                 } else {
-                    w.write_instr(&DecData((regs[reg].data - m.data_begin) >> shift), None)?;
+                    w.write_instr(
+                        &DeltaData(Sign::MINUS, (regs[reg].data - m.data_begin) >> shift),
+                        None,
+                    )?;
                 }
                 regs[reg].data = m.data_begin;
             }
 
             if current_len != m.len {
                 let len = m.len >> shift;
-                if len < 4 {
-                    w.write_instr(&LenSmall(len as u8), None)?;
-                } else {
-                    w.write_instr(&Len(m.len >> shift), None)?;
-                }
+                w.write_instr(&Len(m.len >> shift), None)?;
                 current_len = m.len;
             }
 
@@ -515,7 +576,7 @@ impl Packer {
         }
         w.write_instr(&Halt, None)?;
 
-        let (opcode_bytes, arg_bytes, stats) = w.complete();
+        let (opcode_bytes, arg_bytes, stats) = w.complete()?;
 
         // Merge stats into self.instr_stats
         for (instr, new_stats) in stats {
@@ -576,17 +637,15 @@ impl Packer {
     fn instr_name(instr: u8) -> &'static str {
         match instr {
             0 => "key frame ",
-            1 => "inc thin  ",
-            2 => "dec thin  ",
-            3 => "inc data  ",
-            4 => "dec data  ",
-            5 => "emit      ",
-            6 => "new reg   ",
-            7 => "switch reg",
-            8 => "shift     ",
-            9 => "halt      ",
-            10 => "len       ",
-            11 => "len small ",
+            1 => "delta thin",
+            2 => "delta data",
+            3 => "len       ",
+            4 => "emit      ",
+            5 => "new reg   ",
+            6 => "switch reg",
+            7 => "shift     ",
+            8 => "halt      ",
+            9 => "repeat    ",
             _ => panic!("unknown instruction"),
         }
     }
